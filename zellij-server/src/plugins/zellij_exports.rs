@@ -13,7 +13,7 @@ use log::warn;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
-    io::{Read, Write},
+    io::Write,
     path::PathBuf,
     process,
     str::FromStr,
@@ -6619,20 +6619,36 @@ fn report_panic(env: &PluginEnv, msg: &str) {
 // Helper Functions ---------------------------------------------------------------------------------------------------
 
 pub fn wasi_read_string(plugin_env: &PluginEnv) -> Result<String> {
-    let err_context = || format!("failed to read string from WASI env");
-
-    let mut buf = vec![];
-    plugin_env
-        .stdout_pipe
-        .lock()
-        .unwrap()
-        .read_to_end(&mut buf)
-        .map_err(anyError::new)
-        .with_context(err_context)?;
-    let buf = String::from_utf8_lossy(&buf);
-
     // https://stackoverflow.com/questions/66450942/in-rust-is-there-a-way-to-make-literal-newlines-in-r-using-windows-c
-    Ok(buf.replace("\n", "\n\r"))
+    //
+    // Translated straight off the pipe's own storage, copying each run of bytes
+    // between newlines in bulk. The old form drained the pipe into a `Vec`,
+    // decoded it, then `replace`d the LF with LF CR - peaking at three copies of
+    // the payload on every render, for every plugin. Draining the deque in place
+    // keeps it to one, and the run-copies keep it as fast as `replace`.
+    let mut stdout_pipe = plugin_env.stdout_pipe.lock().unwrap();
+    // `make_contiguous` reshuffles the ring buffer rather than copying it, so this
+    // borrows the queue's existing allocation.
+    let decoded = String::from_utf8_lossy(stdout_pipe.make_contiguous());
+    let extra_bytes = decoded.bytes().filter(|byte| *byte == b'\n').count();
+    let mut translated = String::with_capacity(decoded.len() + extra_bytes);
+    if extra_bytes == 0 {
+        translated.push_str(&decoded);
+    } else {
+        let mut run_start = 0;
+        for (index, byte) in decoded.bytes().enumerate() {
+            if byte == b'\n' {
+                // A newline is ASCII, so it is always a valid char boundary.
+                translated.push_str(&decoded[run_start..index]);
+                translated.push('\n');
+                translated.push('\r');
+                run_start = index + 1;
+            }
+        }
+        translated.push_str(&decoded[run_start..]);
+    }
+    stdout_pipe.clear();
+    Ok(translated)
 }
 
 pub fn wasi_write_string(plugin_env: &PluginEnv, buf: &str) -> Result<()> {

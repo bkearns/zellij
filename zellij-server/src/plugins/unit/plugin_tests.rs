@@ -14829,3 +14829,174 @@ pub fn a_reloaded_plugin_loses_its_settings_entry_until_it_registers_again() {
         );
     });
 }
+
+// A per-thread counting allocator, so an allocation-shaped claim can be asserted
+// as a measurement rather than inferred from reading the code. Thread-local
+// keeps it isolated from the test harness's own concurrent allocations.
+thread_local! {
+    static ALLOCATED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEAK_ALLOCATED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CountingAllocator;
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = ALLOCATED_BYTES.try_with(|current| {
+            let total = current.get() + layout.size();
+            current.set(total);
+            let _ = PEAK_ALLOCATED_BYTES.try_with(|peak| {
+                if total > peak.get() {
+                    peak.set(total);
+                }
+            });
+        });
+        std::alloc::System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        let _ = ALLOCATED_BYTES.try_with(|current| {
+            current.set(current.get().saturating_sub(layout.size()));
+        });
+        std::alloc::System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let _ = ALLOCATED_BYTES.try_with(|current| {
+            let total = current.get() + new_size.saturating_sub(layout.size());
+            current.set(total);
+            let _ = PEAK_ALLOCATED_BYTES.try_with(|peak| {
+                if total > peak.get() {
+                    peak.set(total);
+                }
+            });
+        });
+        std::alloc::System.realloc(ptr, layout, new_size)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin pipe materialization
+//
+// `wasi_read_string` drains the whole stdout pipe into a `String` on every
+// render and every pipe delivery. Two invariants are pinned here:
+//
+//  1. the read must not hold a second copy of the payload (the old
+//     `buf.replace("\n", "\n\r")` doubled every newline), and
+//  2. the buffer must not be able to accumulate without bound between reads.
+//
+// RED as written: the doubling assertion fails on the current implementation,
+// so it fails on the BEHAVIOUR, not on a missing symbol.
+// ---------------------------------------------------------------------------
+
+/// Peak bytes this thread hands to the global allocator while `body` runs.
+fn peak_allocated_during(body: impl FnOnce()) -> usize {
+    let before = ALLOCATED_BYTES.with(|bytes| bytes.get());
+    // Baseline the peak at the current level so what we read back is this body's
+    // high-water mark, not one left behind by an earlier test on this thread.
+    PEAK_ALLOCATED_BYTES.with(|bytes| bytes.set(before));
+    body();
+    let peak = PEAK_ALLOCATED_BYTES.with(|bytes| bytes.get());
+    ALLOCATED_BYTES.with(|bytes| bytes.set(before));
+    PEAK_ALLOCATED_BYTES.with(|bytes| bytes.set(before));
+    peak.saturating_sub(before)
+}
+
+#[test]
+fn reading_a_plugin_pipe_does_not_double_the_payload() {
+    let env = plugin_env_without_read_pane_contents();
+    // 4 KiB of newline-terminated lines, as a bar plugin renders.
+    let rendered = "x".repeat(99).to_owned() + "\n";
+    let rendered = rendered.repeat(40);
+    {
+        let mut stdout = env.stdout_pipe.lock().unwrap();
+        use std::io::Write;
+        stdout.write_all(rendered.as_bytes()).unwrap();
+    }
+
+    let payload_bytes = rendered.len();
+    let peak = peak_allocated_during(|| {
+        let out = super::zellij_exports::wasi_read_string(&env).unwrap();
+        // The host renders CRLF; content must survive the translation intact.
+        assert_eq!(
+            out.matches("\n\r").count(),
+            40,
+            "every newline is translated"
+        );
+    });
+
+    // One copy of the payload is unavoidable. Holding a second full copy - which
+    // `buf.replace(...)` does, because it allocates a whole new String - is not.
+    assert!(
+        peak < payload_bytes * 3 / 2,
+        "reading the pipe allocated {peak} bytes for a {payload_bytes} byte payload, \
+         which is more than one copy; the read is materializing twice"
+    );
+}
+
+#[test]
+fn reading_a_plugin_pipe_translates_newlines_and_keeps_other_text() {
+    let env = plugin_env_without_read_pane_contents();
+    // A bar plugin renders box-drawing and emoji alongside plain text.
+    let rendered = "tab one\n│ pane │ 🚀\n";
+    {
+        let mut stdout = env.stdout_pipe.lock().unwrap();
+        use std::io::Write;
+        stdout.write_all(rendered.as_bytes()).unwrap();
+    }
+
+    let read = super::zellij_exports::wasi_read_string(&env).unwrap();
+
+    // Every LF becomes LF CR, in that order - a CRLF emitted the other way round
+    // renders as a stray carriage return on the host.
+    assert_eq!(read, "tab one\n\r│ pane │ 🚀\n\r");
+    // Multi-byte characters survive; a byte-wise translation would mangle them.
+    assert!(read.contains('│'), "box drawing was corrupted: {read:?}");
+    assert!(read.contains('🚀'), "emoji was corrupted: {read:?}");
+    // Reading drains the pipe, so a second read sees nothing.
+    assert_eq!(super::zellij_exports::wasi_read_string(&env).unwrap(), "");
+}
+
+/// Calibration + comparison for the pipe read. Run with:
+///
+/// ```text
+/// cargo test -p zellij-server --release --lib plugin_pipe_read_throughput \
+///     -- --ignored --nocapture
+/// ```
+///
+/// Reports wall-clock for reading and translating a render-sized payload, so the
+/// before/after of the single-pass translation can be compared on the same
+/// machine. The assertion only guards an absurd regression; the printed figure
+/// is the evidence.
+#[test]
+#[ignore]
+fn plugin_pipe_read_throughput() {
+    use std::io::Write;
+    let env = plugin_env_without_read_pane_contents();
+    let line = "x".repeat(99).to_owned() + "\n";
+
+    for lines in [40usize, 1_000, 10_000] {
+        let payload = line.repeat(lines);
+        let payload_bytes = payload.len();
+        env.stdout_pipe
+            .lock()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let read = super::zellij_exports::wasi_read_string(&env).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            read.matches("\n\r").count(),
+            lines,
+            "translation is complete"
+        );
+        println!(
+            "PERF pipe_read: lines={lines} bytes={payload_bytes} read={:.3}ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}

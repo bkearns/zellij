@@ -1179,6 +1179,53 @@ fn job_already_running(
     }
 }
 
+/// Write `contents` to `live_path` through a staging file.
+///
+/// `before_rename` runs once, after the staging file is complete and before it is
+/// promoted: a test observes what is visible at the live path mid-write, or
+/// returns `Err` to stand in for a crash that never reaches the promote step.
+fn write_file_atomically(
+    live_path: &std::path::Path,
+    contents: &str,
+    before_rename: impl FnOnce(&std::path::Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // Stage beside the live path so the promote below is a same-filesystem
+    // rename, which is atomic: a reader sees either the previous contents or the
+    // new ones, never a truncated file.
+    // Appended rather than `with_extension`, which would replace the extension and
+    // let two sibling files (`foo.yaml`, `foo.kdl`) collide on one staging name.
+    let mut staging_name = live_path.file_name().unwrap_or_default().to_os_string();
+    staging_name.push(".staging");
+    let staging_path = live_path.with_file_name(staging_name);
+    let staged: anyhow::Result<()> = (|| {
+        // The caller relied on the write to create the session's folder on the
+        // first save, so keep doing that here.
+        if let Some(parent) = live_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| anyhow!(error))?;
+        }
+        let mut file = std::fs::File::create(&staging_path).map_err(|error| anyhow!(error))?;
+        write!(file, "{}", contents).map_err(|error| anyhow!(error))?;
+        file.flush().map_err(|error| anyhow!(error))?;
+        // Durability before promotion: a rename onto a file whose data is still in
+        // the page cache can surface as an empty file after a crash.
+        file.sync_all().map_err(|error| anyhow!(error))?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(error);
+    }
+    if let Err(error) = before_rename(&staging_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging_path, live_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(anyhow!(error));
+    }
+    Ok(())
+}
+
 fn file_content_changed(path: &std::path::Path, new_content: &[u8]) -> bool {
     match std::fs::read(path) {
         Ok(existing) => existing != new_content,
@@ -1195,29 +1242,28 @@ pub fn write_session_state_to_disk(
     let (current_session_layout, layout_files_to_write) = current_session_layout;
     let new_metadata = current_session_info.to_string();
     if file_content_changed(&metadata_cache_file_name, new_metadata.as_bytes()) {
-        let _wrote_metadata_file =
-            std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                .and_then(|_| std::fs::File::create(&metadata_cache_file_name))
-                .and_then(|mut f| write!(f, "{}", new_metadata));
+        // Staged and renamed rather than truncated in place: a reader can observe
+        // this file at any moment, and an emptied one is indistinguishable from a
+        // session with no state to restore.
+        write_file_atomically(&metadata_cache_file_name, &new_metadata, |_| Ok(()))
+            .context("failed to write session metadata file")
+            .non_fatal();
     }
 
     if !current_session_layout.is_empty() {
         let layout_cache_file_name = session_layout_cache_file_name(&session_id);
         if file_content_changed(&layout_cache_file_name, current_session_layout.as_bytes()) {
-            let _wrote_layout_file =
-                std::fs::create_dir_all(session_info_folder_for_session(&session_id).as_path())
-                    .and_then(|_| std::fs::File::create(&layout_cache_file_name))
-                    .and_then(|mut f| write!(f, "{}", current_session_layout));
+            write_file_atomically(&layout_cache_file_name, &current_session_layout, |_| Ok(()))
+                .context("failed to write session layout file")
+                .non_fatal();
         }
         let session_info_folder = session_info_folder_for_session(&session_id);
         for (external_file_name, external_file_contents) in layout_files_to_write {
             let external_file_path = session_info_folder.join(&external_file_name);
             if file_content_changed(&external_file_path, external_file_contents.as_bytes()) {
-                std::fs::File::create(&external_file_path)
-                    .and_then(|mut f| write!(f, "{}", external_file_contents))
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to write layout metadata file: {:?}", e);
-                    });
+                write_file_atomically(&external_file_path, &external_file_contents, |_| Ok(()))
+                    .context("failed to write layout metadata file")
+                    .non_fatal();
             }
         }
     }
@@ -1373,6 +1419,74 @@ mod tests {
         let folder = info_dir.join(session);
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("session-layout.kdl"), "layout { }").unwrap();
+    }
+
+    // A reader that treats the session cache as live state must never be able to
+    // observe a half-written file. `File::create` truncates the live path before
+    // the first byte of the new contents lands, so a crash in that window leaves
+    // an empty file that parses as "this session has nothing to preview" rather
+    // than failing. Writing through a staging file and renaming makes the live
+    // path either the old contents or the new ones, never neither.
+    //
+    // RED as written: the live path is observed empty while the write is in
+    // flight, so it fails on the BEHAVIOUR, not on a missing symbol.
+    #[test]
+    fn writing_session_state_never_exposes_a_partial_file() {
+        let dir = tempdir().unwrap();
+        let live_path = dir.path().join("session-metadata.kdl");
+        let previous_contents = "layout {\n    tab name=\"previous\";\n}\n";
+        std::fs::write(&live_path, previous_contents).unwrap();
+
+        let new_contents = "layout {\n    tab name=\"current\";\n}\n";
+        let observed_during_write = std::cell::RefCell::new(Vec::new());
+        write_file_atomically(&live_path, new_contents, |_| {
+            // Whatever is on disk at the live path while the write is in progress.
+            observed_during_write.borrow_mut().push(
+                std::fs::read_to_string(&live_path).unwrap_or_else(|_| "<missing>".to_owned()),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let observed = observed_during_write.into_inner();
+        assert_eq!(observed.len(), 1, "the observer ran exactly once");
+        assert_eq!(
+            observed[0], previous_contents,
+            "the live file was observable in a state that was neither the old nor the new \
+             contents; a reader would treat it as valid state"
+        );
+        assert_eq!(std::fs::read_to_string(&live_path).unwrap(), new_contents);
+    }
+
+    #[test]
+    fn a_failed_atomic_write_leaves_the_previous_contents_intact() {
+        let dir = tempdir().unwrap();
+        let live_path = dir.path().join("session-metadata.kdl");
+        let previous_contents = "layout { }\n";
+        std::fs::write(&live_path, previous_contents).unwrap();
+
+        let result: anyhow::Result<()> =
+            write_file_atomically(&live_path, "layout { broken", |_staging_path| {
+                // Stand in for a crash between the staged write and the promote.
+                Err(anyhow!("interrupted before promote"))
+            });
+
+        assert!(result.is_err(), "the interrupted write reports failure");
+        assert_eq!(
+            std::fs::read_to_string(&live_path).unwrap(),
+            previous_contents,
+            "an interrupted write must not disturb the live file"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "session-metadata.kdl")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging file was left behind: {leftovers:?}"
+        );
     }
 
     #[test]
